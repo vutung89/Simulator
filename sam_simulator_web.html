@@ -1,0 +1,966 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>SAM Simulator (HTML5)</title>
+  <style>
+    :root {
+      --bg: #05080c;
+      --panel: rgba(8, 12, 18, 0.85);
+      --text: #a7b8c8;
+      --accent: #64ff64;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(1200px 800px at 50% 40%, #0b1220 0%, #05080c 60%, #020406 100%);
+      color: var(--text);
+      font-family: "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    .frame {
+      border: 1px solid rgba(150, 180, 200, 0.25);
+      border-radius: 10px;
+      overflow: hidden;
+      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+      background: #000;
+    }
+    canvas {
+      display: block;
+      width: min(1200px, 96vw);
+      height: auto;
+      image-rendering: auto;
+      background: var(--bg);
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <canvas id="sim" width="1200" height="800" aria-label="SAM simulator canvas"></canvas>
+  </div>
+
+  <script>
+    (() => {
+      const WIDTH = 1200;
+      const HEIGHT = 800;
+
+      const BACKGROUND = "rgb(5,8,12)";
+      const LAUNCHER_X = WIDTH / 2;
+      const LAUNCHER_Y = HEIGHT - 60;
+
+      const TARGET_BASE_SPEED = 3.5;
+      const TARGET_NOISE_VEL = 0.12;
+      const TARGET_NOISE_HEAD = 0.8;
+
+      const MISSILE_SPEED = 10.0;
+      const MISSILE_NAV_CONST = 4.5;
+      const MISSILE_MAX_TURN = 6.0;
+      const MISSILE_TRAIL_LEN = 90;
+
+      const APN_LOS_FILTER_ALPHA = 0.35;
+      const APN_ACCEL_FILTER = 0.25;
+      const ZEM_SCALE = 0.018;
+
+      const HIT_RADIUS = 14;
+      const PARTICLE_COUNT = 35;
+      const PARTICLE_LIFESPAN = 45;
+
+      const MAX_MISSILES_PER_TARGET = 2;
+      const SALVO_DELAY_FRAMES = 18;
+      const THREAT_W_CLOSING = 2.0;
+      const THREAT_W_DISTANCE = 1.0;
+
+      const SPEED_STEPS = [0.05, 0.125, 0.25, 0.5, 1.0, 2.0];
+      const SPEED_DEFAULT = 4; // x1.0
+
+      const COL = {
+        missile1: "rgb(255,220,60)",
+        missile2: "rgb(80,220,255)",
+        target: "rgb(220,80,80)",
+        targetBorder: "rgb(255,140,140)",
+        hud: "rgb(100,255,100)",
+        hudDim: "rgb(55,160,55)",
+        paramBright: "rgb(230,238,245)",
+        paramDim: "rgb(150,165,178)",
+        paramLabel: "rgb(180,215,255)",
+        title: "rgb(60,255,60)",
+        subtitle: "rgb(60,200,60)",
+        speedSlow: "rgb(60,200,255)",
+        speedFast: "rgb(255,120,40)",
+        speedNormal: "rgb(100,255,100)",
+        pauseText: "rgb(255,240,60)",
+      };
+
+      const EXP_PALETTE = [
+        [255, 255, 150],
+        [255, 200, 80],
+        [255, 120, 30],
+        [200, 60, 20],
+        [120, 30, 10],
+      ];
+
+      class Vec2 {
+        constructor(x = 0, y = 0) { this.x = x; this.y = y; }
+        clone() { return new Vec2(this.x, this.y); }
+        add(v) { return new Vec2(this.x + v.x, this.y + v.y); }
+        sub(v) { return new Vec2(this.x - v.x, this.y - v.y); }
+        mul(s) { return new Vec2(this.x * s, this.y * s); }
+        dot(v) { return this.x * v.x + this.y * v.y; }
+        lenSq() { return this.x * this.x + this.y * this.y; }
+        len() { return Math.hypot(this.x, this.y); }
+        norm() {
+          const l = this.len();
+          return l < 1e-9 ? new Vec2(0, 0) : this.mul(1 / l);
+        }
+      }
+
+      const rand = (a, b) => a + Math.random() * (b - a);
+      const randInt = (a, b) => Math.floor(rand(a, b + 1));
+      const gauss = (mean = 0, std = 1) => {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return mean + std * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      };
+
+      const headingToVec = (deg) => {
+        const rad = (deg - 90) * Math.PI / 180;
+        return new Vec2(Math.cos(rad), Math.sin(rad));
+      };
+
+      const vecToHeading = (v) => {
+        if (v.lenSq() < 1e-9) return 0;
+        return ((Math.atan2(v.y, v.x) * 180 / Math.PI) + 90 + 360) % 360;
+      };
+
+      function generateTerrain(width, height, yBase) {
+        const pts = [[0, height]];
+        let x = 0;
+        while (x <= width) {
+          pts.push([x, yBase + randInt(-40, 15)]);
+          x += randInt(30, 80);
+        }
+        pts.push([width, height]);
+        return pts;
+      }
+
+      class Particle {
+        constructor(pos) {
+          this.pos = pos.clone();
+          this.vel = headingToVec(rand(0, 360)).mul(rand(1.5, 6.0));
+          this.life = PARTICLE_LIFESPAN;
+          this.maxLife = PARTICLE_LIFESPAN;
+          this.color = EXP_PALETTE[randInt(0, EXP_PALETTE.length - 1)];
+          this.size = randInt(2, 5);
+        }
+        update() {
+          this.pos = this.pos.add(this.vel);
+          this.vel = this.vel.mul(0.93);
+          this.life -= 1;
+        }
+        draw(ctx) {
+          const f = Math.max(this.life / this.maxLife, 0);
+          const [r, g, b] = this.color;
+          ctx.fillStyle = `rgb(${Math.floor(r * f)},${Math.floor(g * f)},${Math.floor(b * f)})`;
+          circle(ctx, this.pos.x, this.pos.y, this.size, true);
+        }
+        get dead() { return this.life <= 0; }
+      }
+
+      class Target {
+        static RADIUS = 9;
+        static idCounter = 0;
+
+        constructor() {
+          Target.idCounter += 1;
+          this.id = Target.idCounter;
+          this.label = `TGT-${String(this.id).padStart(2, "0")}`;
+          this.spawn();
+        }
+
+        spawn() {
+          const side = ["top", "left", "right"][randInt(0, 2)];
+          if (side === "top") {
+            this.pos = new Vec2(randInt(80, WIDTH - 80), -20);
+            this.heading = rand(135, 225);
+          } else if (side === "left") {
+            this.pos = new Vec2(-20, randInt(30, HEIGHT / 2));
+            this.heading = rand(50, 155);
+          } else {
+            this.pos = new Vec2(WIDTH + 20, randInt(30, HEIGHT / 2));
+            this.heading = rand(205, 310);
+          }
+
+          this.speed = TARGET_BASE_SPEED + rand(-0.5, 1.5);
+          this.vel = headingToVec(this.heading).mul(this.speed);
+          this.alive = true;
+          this.trail = [];
+          this.missilesAssigned = 0;
+        }
+
+        update() {
+          const noisySpeed = this.speed + gauss(0, TARGET_NOISE_VEL);
+          this.heading = (this.heading + gauss(0, TARGET_NOISE_HEAD) + 360) % 360;
+          this.vel = headingToVec(this.heading).mul(noisySpeed);
+          this.trail.push(this.pos.clone());
+          if (this.trail.length > 55) this.trail.shift();
+          this.pos = this.pos.add(this.vel);
+
+          const margin = 80;
+          if (this.pos.x < -margin || this.pos.x > WIDTH + margin || this.pos.y < -margin || this.pos.y > HEIGHT + margin) {
+            this.alive = false;
+          }
+        }
+
+        draw(ctx) {
+          if (!this.alive) return;
+
+          for (let i = 0; i < this.trail.length; i += 1) {
+            const a = Math.floor(85 * i / Math.max(this.trail.length, 1));
+            ctx.fillStyle = `rgb(${a},${a},${a})`;
+            circle(ctx, this.trail[i].x, this.trail[i].y, 2, true);
+          }
+
+          const ix = this.pos.x;
+          const iy = this.pos.y;
+
+          if (this.missilesAssigned > 0) {
+            const ringCol = this.missilesAssigned >= MAX_MISSILES_PER_TARGET ? "rgb(255,55,55)" : "rgb(255,185,30)";
+            strokeCircle(ctx, ix, iy, Target.RADIUS + 6, ringCol, 2);
+          }
+
+          ctx.fillStyle = COL.target;
+          circle(ctx, ix, iy, Target.RADIUS, true);
+          strokeCircle(ctx, ix, iy, Target.RADIUS, COL.targetBorder, 2);
+
+          const tip = this.pos.add(headingToVec(this.heading).mul(Target.RADIUS + 8));
+          line(ctx, ix, iy, tip.x, tip.y, "rgb(255,80,80)", 2);
+
+          if (this.missilesAssigned > 0) {
+            ctx.font = "600 12px Segoe UI";
+            ctx.fillStyle = this.missilesAssigned >= MAX_MISSILES_PER_TARGET ? "rgb(255,70,70)" : "rgb(255,210,50)";
+            const t = `x${this.missilesAssigned}`;
+            const tw = ctx.measureText(t).width;
+            ctx.fillText(t, ix - tw / 2, iy - Target.RADIUS - 12);
+          }
+
+          const spdStr = `V ${this.speed.toFixed(2)} (${(this.speed * 0.96).toFixed(2)})`;
+          const hdgStr = `H ${(this.heading - 180).toFixed(2).padStart(7, " ")}`;
+          const lblStr = this.label;
+
+          const ox = ix + 15;
+          let oy = iy - 42;
+          const lineH = 18;
+
+          ctx.font = "600 12px Segoe UI";
+          const maxW = Math.max(
+            ctx.measureText(lblStr).width,
+            ctx.measureText(spdStr).width,
+            ctx.measureText(hdgStr).width
+          ) + 12;
+
+          const panelH = lineH * 3 + 6;
+          fillRect(ctx, ox - 5, oy - 3, maxW, panelH, "rgba(5,10,18,0.76)");
+          fillRect(ctx, ox - 5, oy - 3, 2, panelH, COL.targetBorder);
+
+          ctx.fillStyle = COL.paramLabel;
+          ctx.fillText(lblStr, ox, oy + 12);
+          oy += lineH - 1;
+
+          ctx.fillStyle = COL.paramBright;
+          ctx.fillText(spdStr, ox, oy + 12);
+          oy += lineH;
+
+          ctx.fillStyle = COL.paramDim;
+          ctx.fillText(hdgStr, ox, oy + 12);
+        }
+      }
+
+      class Missile {
+        static LENGTH = 15;
+        static WIDTH = 4;
+
+        constructor(pos, target, salvoIndex = 0) {
+          this.pos = pos.clone();
+          this.target = target;
+          this.salvoIndex = salvoIndex;
+          this.speed = MISSILE_SPEED;
+          this.heading = vecToHeading(target.pos.sub(pos));
+          this.vel = headingToVec(this.heading).mul(this.speed);
+          this.alive = true;
+          this.trail = [];
+
+          this.prevLosRad = null;
+          this.losRateFilt = 0;
+          this.prevTargetVel = null;
+          this.targetAccelFilt = new Vec2(0, 0);
+        }
+
+        apnGuidance() {
+          const rVec = this.target.pos.sub(this.pos);
+          const rMag = rVec.len();
+          if (rMag < 1e-3) return 0;
+
+          const losNow = Math.atan2(rVec.y, rVec.x);
+
+          if (this.prevLosRad === null) {
+            this.prevLosRad = losNow;
+            this.prevTargetVel = this.target.vel.clone();
+            return 0;
+          }
+
+          let losRateRaw = losNow - this.prevLosRad;
+          if (losRateRaw > Math.PI) losRateRaw -= 2 * Math.PI;
+          if (losRateRaw < -Math.PI) losRateRaw += 2 * Math.PI;
+          this.prevLosRad = losNow;
+
+          const a = APN_LOS_FILTER_ALPHA;
+          this.losRateFilt = a * losRateRaw + (1 - a) * this.losRateFilt;
+
+          const rHat = rVec.mul(1 / rMag);
+          const vRel = this.target.vel.sub(this.vel);
+          const vc = -rHat.dot(vRel);
+
+          const curVel = this.target.vel.clone();
+          if (this.prevTargetVel) {
+            const b = APN_ACCEL_FILTER;
+            this.targetAccelFilt = curVel.sub(this.prevTargetVel).mul(b).add(this.targetAccelFilt.mul(1 - b));
+          }
+          this.prevTargetVel = curVel;
+
+          const losPerp = new Vec2(-rHat.y, rHat.x);
+          const aTPerp = this.targetAccelFilt.dot(losPerp);
+
+          const N = MISSILE_NAV_CONST;
+          const pnTerm = N * Math.max(vc, 0.1) * (this.losRateFilt * 180 / Math.PI) * 0.06;
+          const apnTerm = (N / 2) * aTPerp * 0.9;
+
+          const tGo = rMag / Math.max(Math.abs(vc), 0.5);
+          const zem = rHat.x * vRel.y - rHat.y * vRel.x;
+          const zemTerm = zem * ZEM_SCALE / Math.max(tGo * 0.016, 0.05);
+
+          return pnTerm + apnTerm + zemTerm;
+        }
+
+        update() {
+          if (!this.target.alive) {
+            this.alive = false;
+            return;
+          }
+
+          let turn = this.apnGuidance();
+          turn = Math.max(-MISSILE_MAX_TURN, Math.min(MISSILE_MAX_TURN, turn));
+
+          this.heading = (this.heading + turn + 360) % 360;
+          this.vel = headingToVec(this.heading).mul(this.speed);
+          this.trail.push(this.pos.clone());
+          if (this.trail.length > MISSILE_TRAIL_LEN) this.trail.shift();
+          this.pos = this.pos.add(this.vel);
+
+          if (this.pos.x < -50 || this.pos.x > WIDTH + 50 || this.pos.y < -50 || this.pos.y > HEIGHT + 50) {
+            this.alive = false;
+          }
+        }
+
+        draw(ctx) {
+          if (!this.alive) return;
+
+          const n = this.trail.length;
+          for (let i = 0; i < n; i += 1) {
+            const frac = i / Math.max(n, 1);
+            const bright = Math.floor(30 + 130 * frac);
+            const rad = Math.max(1, Math.floor(3 * (1 - frac) + 1));
+            ctx.fillStyle = `rgb(${bright},${bright},${bright})`;
+            circle(ctx, this.trail[i].x, this.trail[i].y, rad, true);
+          }
+
+          const bodyCol = this.salvoIndex === 1 ? COL.missile2 : COL.missile1;
+          const glowCol = this.salvoIndex === 1 ? "rgb(80,200,255)" : "rgb(255,100,0)";
+          const angleRad = (this.heading - 90) * Math.PI / 180;
+          const ca = Math.cos(angleRad), sa = Math.sin(angleRad);
+
+          const rot = (lx, ly) => ({
+            x: lx * ca - ly * sa + this.pos.x,
+            y: lx * sa + ly * ca + this.pos.y,
+          });
+
+          const nose = rot(0, -Missile.LENGTH);
+          const left = rot(-Missile.WIDTH, Missile.LENGTH / 2);
+          const right = rot(Missile.WIDTH, Missile.LENGTH / 2);
+          const tail = rot(0, Missile.LENGTH / 3);
+
+          polygon(ctx, [nose, left, tail, right], bodyCol, true);
+          polygonStroke(ctx, [nose, left, tail, right], "rgb(255,255,200)", 1);
+          circle(ctx, rot(0, Missile.LENGTH / 2).x, rot(0, Missile.LENGTH / 2).y, 3, true, glowCol);
+
+          const tagStr = `[S${this.salvoIndex + 1}]`;
+          const spdStr = `V ${this.speed.toFixed(2)} (${(this.speed * 0.96).toFixed(2)})`;
+          const hdgStr = `H ${(this.heading - 180).toFixed(2).padStart(7, " ")}`;
+
+          const ix = this.pos.x;
+          const iy = this.pos.y;
+          const ox = ix + 17;
+          let oy = iy - 42;
+          const lineH = 18;
+
+          ctx.font = "600 12px Segoe UI";
+          const maxW = Math.max(ctx.measureText(tagStr).width, ctx.measureText(spdStr).width, ctx.measureText(hdgStr).width) + 12;
+          const panelH = lineH * 3 + 6;
+
+          fillRect(ctx, ox - 5, oy - 3, maxW, panelH, "rgba(5,10,18,0.76)");
+          fillRect(ctx, ox - 5, oy - 3, 2, panelH, bodyCol);
+
+          ctx.fillStyle = bodyCol;
+          ctx.fillText(tagStr, ox, oy + 12);
+          oy += lineH - 1;
+          ctx.fillStyle = COL.paramBright;
+          ctx.fillText(spdStr, ox, oy + 12);
+          oy += lineH;
+          ctx.fillStyle = COL.paramDim;
+          ctx.fillText(hdgStr, ox, oy + 12);
+        }
+      }
+
+      class MissileAllocator {
+        constructor() {
+          this.queue = [];
+          this.frame = 0;
+        }
+
+        threatScore(target, launcherPos) {
+          const rVec = launcherPos.sub(target.pos);
+          const dist = Math.max(rVec.len(), 1.0);
+          const rHat = rVec.mul(1 / dist);
+          const vc = Math.max(target.vel.dot(rHat), 0.0);
+          return THREAT_W_CLOSING * vc + THREAT_W_DISTANCE * (1000.0 / dist);
+        }
+
+        allocate(targets, missiles, launcherPos) {
+          const live = targets.filter((t) => t.alive);
+          if (!live.length) return;
+
+          for (const t of live) {
+            t.missilesAssigned = missiles.filter((m) => m.alive && m.target === t).length;
+          }
+
+          const ranked = [...live].sort((a, b) => this.threatScore(b, launcherPos) - this.threatScore(a, launcherPos));
+          const queuedTargets = new Set(this.queue.map((e) => e.target));
+
+          for (const target of ranked) {
+            if (queuedTargets.has(target)) continue;
+            const needed = MAX_MISSILES_PER_TARGET - target.missilesAssigned;
+            for (let i = 0; i < needed; i += 1) {
+              const salvoIdx = target.missilesAssigned + i;
+              const fireFrame = this.frame + i * SALVO_DELAY_FRAMES;
+              this.queue.push({ target, salvoIdx, fireFrame });
+            }
+          }
+        }
+
+        tick(launcherPos) {
+          this.frame += 1;
+          const newMissiles = [];
+          const pending = [];
+          for (const q of this.queue) {
+            if (!q.target.alive) continue;
+            if (this.frame >= q.fireFrame) {
+              const m = new Missile(launcherPos, q.target, q.salvoIdx);
+              q.target.missilesAssigned += 1;
+              newMissiles.push(m);
+            } else {
+              pending.push(q);
+            }
+          }
+          this.queue = pending;
+          return newMissiles;
+        }
+
+        reset() {
+          this.queue.length = 0;
+          this.frame = 0;
+        }
+      }
+
+      class Simulation {
+        constructor(canvas) {
+          this.canvas = canvas;
+          this.ctx = canvas.getContext("2d");
+          this.terrain = generateTerrain(WIDTH, HEIGHT, HEIGHT - 80);
+          this.stars = this.buildStars();
+          this.allocator = new MissileAllocator();
+
+          this.speedIdx = SPEED_DEFAULT;
+          this.paused = false;
+          this.pauseTick = 0;
+
+          this.targets = [];
+          this.missiles = [];
+          this.particles = [];
+          this.kills = 0;
+
+          this.lastTime = performance.now();
+          this.running = true;
+
+          this.setupInput();
+          for (let i = 0; i < 3; i += 1) this.spawnTarget();
+          requestAnimationFrame(this.loop.bind(this));
+        }
+
+        get gameSpeed() { return SPEED_STEPS[this.speedIdx]; }
+
+        buildStars() {
+          const stars = [];
+          let seed = 42;
+          const r = () => {
+            seed = (seed * 1664525 + 1013904223) >>> 0;
+            return seed / 0xffffffff;
+          };
+          for (let i = 0; i < 80; i += 1) {
+            stars.push({
+              x: Math.floor(r() * WIDTH),
+              y: Math.floor(r() * (HEIGHT / 2)),
+              b: Math.floor(60 + r() * 140),
+            });
+          }
+          return stars;
+        }
+
+        reset() {
+          this.targets.length = 0;
+          this.missiles.length = 0;
+          this.particles.length = 0;
+          this.kills = 0;
+          this.allocator.reset();
+          Target.idCounter = 0;
+        }
+
+        spawnTarget() {
+          const t = new Target();
+          this.targets.push(t);
+          this.allocator.allocate(this.targets, this.missiles, new Vec2(LAUNCHER_X, LAUNCHER_Y));
+        }
+
+        manualLaunch() {
+          const lp = new Vec2(LAUNCHER_X, LAUNCHER_Y);
+          const live = this.targets.filter((t) => t.alive);
+          if (!live.length) return;
+
+          for (const t of live) {
+            t.missilesAssigned = this.missiles.filter((m) => m.alive && m.target === t).length;
+          }
+          const cands = live.filter((t) => t.missilesAssigned < MAX_MISSILES_PER_TARGET);
+          if (!cands.length) return;
+
+          let best = cands[0];
+          let bestScore = this.allocator.threatScore(best, lp);
+          for (let i = 1; i < cands.length; i += 1) {
+            const sc = this.allocator.threatScore(cands[i], lp);
+            if (sc > bestScore) {
+              best = cands[i];
+              bestScore = sc;
+            }
+          }
+
+          const m = new Missile(lp, best, best.missilesAssigned);
+          best.missilesAssigned += 1;
+          this.missiles.push(m);
+        }
+
+        checkHits() {
+          for (const missile of this.missiles) {
+            if (!missile.alive) continue;
+            for (const target of this.targets) {
+              if (!target.alive) continue;
+              if (missile.pos.sub(target.pos).len() < HIT_RADIUS) {
+                const mid = missile.pos.add(target.pos).mul(0.5);
+                for (let i = 0; i < PARTICLE_COUNT; i += 1) this.particles.push(new Particle(mid));
+
+                for (const m2 of this.missiles) {
+                  if (m2.alive && m2.target === target) m2.alive = false;
+                }
+
+                target.alive = false;
+                target.missilesAssigned = 0;
+                this.kills += 1;
+              }
+            }
+          }
+        }
+
+        drawEngagementLines() {
+          const map = new Map();
+          for (const m of this.missiles) {
+            if (m.alive && m.target.alive) {
+              if (!map.has(m.target)) map.set(m.target, []);
+              map.get(m.target).push(m);
+            }
+          }
+
+          for (const [target, mlist] of map.entries()) {
+            const tx = target.pos.x, ty = target.pos.y;
+            for (const m of mlist) {
+              const col = m.salvoIndex === 1 ? "rgb(80,200,255)" : "rgb(60,180,255)";
+              const dx = tx - LAUNCHER_X;
+              const dy = ty - LAUNCHER_Y;
+              const length = Math.hypot(dx, dy);
+              if (length < 1) continue;
+
+              const steps = Math.floor(length / 14);
+              for (let s = 0; s < steps; s += 1) {
+                if (s % 2 === 0) {
+                  const x0 = LAUNCHER_X + (dx * s / Math.max(steps, 1));
+                  const y0 = LAUNCHER_Y + (dy * s / Math.max(steps, 1));
+                  const x1 = LAUNCHER_X + (dx * (s + 1) / Math.max(steps, 1));
+                  const y1 = LAUNCHER_Y + (dy * (s + 1) / Math.max(steps, 1));
+                  line(this.ctx, x0, y0, x1, y1, col, 1);
+                }
+              }
+            }
+          }
+        }
+
+        drawLauncher() {
+          const x = LAUNCHER_X, y = LAUNCHER_Y;
+          fillRoundRect(this.ctx, x - 32, y + 10, 64, 14, 4, "rgb(80,80,80)");
+          fillRoundRect(this.ctx, x - 4, y - 18, 8, 28, 3, "rgb(255,165,0)");
+          if (Math.random() < 0.3) circle(this.ctx, x, y - 18, 4, true, "rgb(255,160,30)");
+
+          this.ctx.font = "600 11px Segoe UI";
+          this.ctx.fillStyle = "rgb(180,180,180)";
+          const t = "LAUNCHER";
+          this.ctx.fillText(t, x - this.ctx.measureText(t).width / 2, y + 40);
+        }
+
+        drawSpeedPanel() {
+          const ctx = this.ctx;
+          const spd = this.gameSpeed;
+          const px = WIDTH - 224;
+          const py = 12;
+
+          if (this.paused) {
+            this.pauseTick = (this.pauseTick + 1) % 60;
+            if (this.pauseTick < 40) {
+              fillRect(ctx, px, py, 96, 28, "rgba(190,15,15,0.82)");
+              ctx.fillStyle = COL.pauseText;
+              ctx.font = "600 14px Segoe UI";
+              ctx.fillText("II  PAUSED", px + 6, py + 19);
+            }
+          } else {
+            this.pauseTick = 0;
+          }
+
+          const bx = px;
+          const by = py + 36;
+          const spdCol = spd < 1 ? COL.speedSlow : (spd > 1 ? COL.speedFast : COL.speedNormal);
+
+          fillRect(ctx, bx, by, 210, 16, "rgba(18,18,18,0.73)");
+          const fillW = Math.floor(210 * (this.speedIdx + 1) / SPEED_STEPS.length);
+          if (fillW > 0) fillRect(ctx, bx, by, fillW, 16, rgbaFromCss(spdCol, 0.64));
+
+          rectStroke(ctx, bx, by, 210, 16, spdCol, 1);
+          for (let i = 0; i < SPEED_STEPS.length; i += 1) {
+            const tx = bx + Math.floor(210 * (i + 1) / SPEED_STEPS.length);
+            const tc = i <= this.speedIdx ? spdCol : "rgb(45,45,45)";
+            line(ctx, tx, by, tx, by + 16, tc, 1);
+          }
+
+          ctx.font = "600 14px Segoe UI";
+          ctx.fillStyle = spdCol;
+          ctx.fillText(`SPEED  x${Number(spd).toPrecision(3).replace(/\.0+$/, "")}`, bx, by + 31);
+
+          ctx.font = "600 11px Segoe UI";
+          ctx.fillStyle = COL.hudDim;
+          ctx.fillText("[-] slow  [+] fast  [0] x1  [P] pause", bx, by + 49);
+        }
+
+        drawHud() {
+          const ctx = this.ctx;
+
+          ctx.font = "700 28px Segoe UI";
+          ctx.fillStyle = COL.title;
+          const title = "SAM Simulator";
+          ctx.fillText(title, WIDTH / 2 - ctx.measureText(title).width / 2, 36);
+
+          ctx.font = "600 18px Segoe UI";
+          ctx.fillStyle = COL.subtitle;
+          const sub1 = "Designed and Developed by Time Lapse Coder";
+          const sub2 = "APN Guidance  |  Threat-Priority Allocation";
+          ctx.fillText(sub1, WIDTH / 2 - ctx.measureText(sub1).width / 2, 65);
+          ctx.fillText(sub2, WIDTH / 2 - ctx.measureText(sub2).width / 2, 85);
+
+          const activeT = this.targets.filter((t) => t.alive).length;
+          const activeM = this.missiles.filter((m) => m.alive).length;
+          const stats = [
+            `Targets  : ${activeT}`,
+            `Missiles : ${activeM}`,
+            `Kills    : ${this.kills}`,
+            `LauncherX: ${LAUNCHER_X}`,
+          ];
+
+          ctx.font = "600 14px Consolas, monospace";
+          ctx.fillStyle = COL.hud;
+          for (let i = 0; i < stats.length; i += 1) {
+            ctx.fillText(stats[i], 12, HEIGHT - 150 + i * 20);
+          }
+
+          const lp = new Vec2(LAUNCHER_X, LAUNCHER_Y);
+          const live = this.targets.filter((t) => t.alive)
+            .sort((a, b) => this.allocator.threatScore(b, lp) - this.allocator.threatScore(a, lp));
+
+          ctx.font = "700 14px Segoe UI";
+          ctx.fillStyle = COL.title;
+          ctx.fillText("ENGAGEMENT TABLE", WIDTH - 275, HEIGHT - 170);
+
+          ctx.font = "600 11px Consolas, monospace";
+          ctx.fillStyle = COL.hudDim;
+          ctx.fillText("Target       Score  Msls", WIDTH - 275, HEIGHT - 152);
+          line(ctx, WIDTH - 275, HEIGHT - 138, WIDTH - 22, HEIGHT - 138, COL.hudDim, 1);
+
+          for (let i = 0; i < Math.min(live.length, 6); i += 1) {
+            const t = live[i];
+            const score = this.allocator.threatScore(t, lp);
+            const bar = "+".repeat(t.missilesAssigned) + ".".repeat(MAX_MISSILES_PER_TARGET - t.missilesAssigned);
+            const row = `${t.label.padEnd(10, " ")} ${score.toFixed(1).padStart(7, " ")}  ${bar}`;
+            ctx.fillStyle = t.missilesAssigned >= MAX_MISSILES_PER_TARGET ? "rgb(255,70,70)" : COL.paramBright;
+            ctx.fillText(row, WIDTH - 275, HEIGHT - 122 + i * 17);
+          }
+
+          const legend = [["S1", COL.missile1, " yellow missile"], ["S2", COL.missile2, " cyan missile"]];
+          for (let i = 0; i < legend.length; i += 1) {
+            const [sym, col, lbl] = legend[i];
+            ctx.fillStyle = col;
+            ctx.fillText(sym, WIDTH - 275, HEIGHT - 228 + i * 15);
+            ctx.fillStyle = COL.paramDim;
+            ctx.fillText(lbl, WIDTH - 258, HEIGHT - 228 + i * 15);
+          }
+
+          const ctrls = [
+            "[T] Spawn + Auto-Alloc",
+            "[A] Allocate All Threats",
+            "[F/SPC] Manual Fire",
+            "[R] Reset  [ESC] Quit",
+          ];
+
+          ctx.fillStyle = "rgb(75,145,75)";
+          for (let i = 0; i < ctrls.length; i += 1) {
+            ctx.fillText(ctrls[i], 12, 24 + i * 14);
+          }
+
+          this.drawSpeedPanel();
+        }
+
+        setupInput() {
+          window.addEventListener("keydown", (e) => {
+            if (!this.running) return;
+
+            const k = e.key;
+            if ([" ", "+", "=", "-", "0", "p", "P", "f", "F", "a", "A", "t", "T", "r", "R", "Escape"].includes(k)) {
+              e.preventDefault();
+            }
+
+            if (k === "Escape") {
+              this.running = false;
+            } else if (k === "p" || k === "P") {
+              this.paused = !this.paused;
+            } else if (k === "+" || k === "=" || k === "Add") {
+              this.speedIdx = Math.min(this.speedIdx + 1, SPEED_STEPS.length - 1);
+            } else if (k === "-" || k === "Subtract") {
+              this.speedIdx = Math.max(this.speedIdx - 1, 0);
+            } else if (k === "0") {
+              this.speedIdx = SPEED_DEFAULT;
+            } else if (k === "t" || k === "T") {
+              this.spawnTarget();
+            } else if (k === "a" || k === "A") {
+              this.allocator.allocate(this.targets, this.missiles, new Vec2(LAUNCHER_X, LAUNCHER_Y));
+            } else if (k === " " || k === "f" || k === "F") {
+              this.manualLaunch();
+            } else if (k === "r" || k === "R") {
+              this.reset();
+            }
+          });
+        }
+
+        update(dt) {
+          if (this.paused) return;
+
+          const launchPos = new Vec2(LAUNCHER_X, LAUNCHER_Y);
+
+          const subSteps = Math.max(1, Math.floor(this.gameSpeed));
+          const scaledDt = dt * this.gameSpeed;
+          const subDt = scaledDt / subSteps;
+
+          for (let i = 0; i < subSteps; i += 1) {
+            const newMissiles = this.allocator.tick(launchPos);
+            this.missiles.push(...newMissiles);
+
+            for (const t of this.targets) t.update(subDt);
+            for (const m of this.missiles) m.update(subDt);
+            for (const p of this.particles) p.update(subDt);
+
+            this.checkHits();
+          }
+
+          for (const t of this.targets) {
+            if (t.alive) {
+              t.missilesAssigned = this.missiles.filter((m) => m.alive && m.target === t).length;
+            }
+          }
+
+          this.targets = this.targets.filter((t) => t.alive);
+          this.missiles = this.missiles.filter((m) => m.alive);
+          this.particles = this.particles.filter((p) => !p.dead);
+        }
+
+        render() {
+          const ctx = this.ctx;
+
+          fillRect(ctx, 0, 0, WIDTH, HEIGHT, BACKGROUND);
+
+          for (const s of this.stars) {
+            circle(ctx, s.x, s.y, 1, true, `rgb(${s.b},${s.b},${s.b})`);
+          }
+
+          polygon(ctx, this.terrain.map(([x, y]) => ({ x, y })), "rgb(40,45,45)", true);
+          polyline(ctx, this.terrain.slice(1, -1).map(([x, y]) => ({ x, y })), "rgb(70,80,80)", 2);
+
+          this.drawEngagementLines();
+          this.drawLauncher();
+
+          for (const t of this.targets) t.draw(ctx);
+          for (const m of this.missiles) m.draw(ctx);
+          for (const p of this.particles) p.draw(ctx);
+
+          this.drawHud();
+
+          if (this.paused) {
+            fillRect(ctx, 0, 0, WIDTH, HEIGHT, "rgba(0,0,0,0.24)");
+
+            ctx.font = "700 28px Segoe UI";
+            const txt = "-- PAUSED --";
+            const tw = ctx.measureText(txt).width;
+            const tx = WIDTH / 2 - tw / 2;
+            const ty = HEIGHT / 2;
+
+            fillRect(ctx, tx - 14, ty - 26, tw + 28, 42, "rgba(10,10,10,0.82)");
+            ctx.fillStyle = COL.pauseText;
+            ctx.fillText(txt, tx, ty + 2);
+
+            ctx.font = "600 14px Segoe UI";
+            const hint = "Press  P  to resume";
+            ctx.fillStyle = "rgb(160,160,160)";
+            ctx.fillText(hint, WIDTH / 2 - ctx.measureText(hint).width / 2, ty + 30);
+          }
+
+          if (!this.running) {
+            fillRect(ctx, 0, 0, WIDTH, HEIGHT, "rgba(0,0,0,0.55)");
+            ctx.font = "700 26px Segoe UI";
+            ctx.fillStyle = "rgb(220,220,220)";
+            const t = "Simulation Stopped (press R to reset in page reload)";
+            ctx.fillText(t, WIDTH / 2 - ctx.measureText(t).width / 2, HEIGHT / 2);
+          }
+        }
+
+        loop(now) {
+          const dt = Math.min((now - this.lastTime) / 1000, 0.05);
+          this.lastTime = now;
+
+          if (this.running) this.update(dt);
+          this.render();
+
+          requestAnimationFrame(this.loop.bind(this));
+        }
+      }
+
+      function fillRect(ctx, x, y, w, h, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, w, h);
+      }
+
+      function rectStroke(ctx, x, y, w, h, color, lineWidth = 1) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = lineWidth;
+        ctx.strokeRect(x, y, w, h);
+      }
+
+      function line(ctx, x0, y0, x1, y1, color, width = 1) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(x1, y1);
+        ctx.stroke();
+      }
+
+      function circle(ctx, x, y, r, fill = true, color = null) {
+        if (color) {
+          if (fill) ctx.fillStyle = color;
+          else ctx.strokeStyle = color;
+        }
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        fill ? ctx.fill() : ctx.stroke();
+      }
+
+      function strokeCircle(ctx, x, y, r, color, width = 1) {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        circle(ctx, x, y, r, false);
+      }
+
+      function polygon(ctx, pts, color, fill = true) {
+        if (!pts.length) return;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i += 1) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.closePath();
+        if (fill) {
+          ctx.fillStyle = color;
+          ctx.fill();
+        } else {
+          ctx.strokeStyle = color;
+          ctx.stroke();
+        }
+      }
+
+      function polygonStroke(ctx, pts, color, width = 1) {
+        ctx.lineWidth = width;
+        polygon(ctx, pts, color, false);
+      }
+
+      function polyline(ctx, pts, color, width = 1) {
+        if (pts.length < 2) return;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = width;
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for (let i = 1; i < pts.length; i += 1) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+      }
+
+      function fillRoundRect(ctx, x, y, w, h, r, color) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      function rgbaFromCss(rgb, alpha) {
+        const m = rgb.match(/\d+/g);
+        if (!m || m.length < 3) return rgb;
+        return `rgba(${m[0]},${m[1]},${m[2]},${alpha})`;
+      }
+
+      const canvas = document.getElementById("sim");
+      new Simulation(canvas);
+    })();
+  </script>
+</body>
+</html>

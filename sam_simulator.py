@@ -502,13 +502,13 @@ class Simulation:
         self.clock  = pygame.time.Clock()
 
         # ── Fonts ──────────────────────────────────────────────────
-        self.font_title  = pygame.font.SysFont("Courier New", 28, bold=True)
-        self.font_sub    = pygame.font.SysFont("Courier New", 18, bold=True)
-        self.font_hud    = pygame.font.SysFont("Courier New", 14, bold=True)
+        self.font_title  = pygame.font.Font(None, 28)
+        self.font_sub    = pygame.font.Font(None, 18)
+        self.font_hud    = pygame.font.Font(None, 14)
         # Larger, bolder parameter fonts for entity HUD readouts
-        self.font_param  = pygame.font.SysFont("Courier New", 13, bold=True)  # V / H values
-        self.font_label  = pygame.font.SysFont("Courier New", 12, bold=True)  # entity label/tag
-        self.font_small  = pygame.font.SysFont("Courier New", 11)             # misc small text
+        self.font_param  = pygame.font.Font(None, 13)  # V / H values
+        self.font_label  = pygame.font.Font(None, 12)  # entity label/tag
+        self.font_small  = pygame.font.Font(None, 11)             # misc small text
 
         self.terrain   = generate_terrain(WIDTH, HEIGHT, HEIGHT - 80)
         self.allocator = MissileAllocator()
